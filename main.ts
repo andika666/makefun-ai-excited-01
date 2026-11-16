@@ -1,580 +1,675 @@
-// Phoenix Unframed — a phoenix bursting out of a framed painting over a neon city.
-// Every pixel is computed here: gradients, shapes, particles and layered glow.
-// Standard library only (node:fs, node:path, node:zlib). Deterministic: fixed seed,
-// no time, no randomness from the environment, no network. Writes one PNG to
-// $MAKEFUN_OUTPUT_DIR/entry.png (default /output), 1024x1024, well under 1 MiB.
-const fs = require("node:fs");
-const path = require("node:path");
-const zlib = require("node:zlib");
+// Phoenix Rising — an original deterministic image generator for make.fun
+// bounty ai-excited-01 ("Make the AI judge excited").
+// A golden/crimson phoenix bursts out of a gilt-framed painting over a
+// neon city at night. Everything is drawn in code: no image assets, no
+// network, no clock, no randomness outside a fixed-seed PRNG, so two runs
+// produce byte-identical PNG output.
+//
+// Node 22, standard library only (node:fs, node:path, node:zlib).
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as zlib from "node:zlib";
 
 const W = 1024;
 const H = 1024;
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR || "/output";
-const OUT_PATH = path.join(OUT_DIR, "entry.png");
 
-// ---- deterministic PRNG (mulberry32, fixed seed) ----
-let seedState = 20261116;
-function rnd() {
-  seedState |= 0;
-  seedState = (seedState + 0x6d2b79f5) | 0;
-  let t = Math.imul(seedState ^ (seedState >>> 15), 1 | seedState);
-  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+// ---------------------------------------------------------------------------
+// Deterministic PRNG (mulberry32) — fixed seed, no Math.random / Date.now.
+// ---------------------------------------------------------------------------
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
 }
-function rr(a, b) {
-  return a + rnd() * (b - a);
+const rand = mulberry32(0x9e3779b9);
+function rr(min, max) {
+  return min + rand() * (max - min);
+}
+function ri(min, max) {
+  return Math.floor(rr(min, max + 1));
 }
 function pick(arr) {
-  return arr[Math.floor(rnd() * arr.length)];
+  return arr[Math.floor(rand() * arr.length)];
 }
 
-// ---- pixel buffer (RGB, 8 bit) ----
-const px = Buffer.alloc(W * H * 3);
+// ---------------------------------------------------------------------------
+// Canvas: RGBA pixel buffer with src-over blending.
+// ---------------------------------------------------------------------------
+const buf = new Uint8Array(W * H * 4);
 
-function blend(x, y, r, g, b, a) {
-  const ix = Math.round(x);
-  const iy = Math.round(y);
-  if (ix < 0 || ix >= W || iy < 0 || iy >= H) return;
-  if (a <= 0) return;
-  if (a > 1) a = 1;
-  const o = (iy * W + ix) * 3;
-  const ia = 1 - a;
-  px[o] = Math.round(px[o] * ia + r * a);
-  px[o + 1] = Math.round(px[o + 1] * ia + g * a);
-  px[o + 2] = Math.round(px[o + 2] * ia + b * a);
-}
-function setPx(x, y, r, g, b) {
-  blend(x, y, r, g, b, 1);
+function blendPixel(x, y, r, g, b, a) {
+  if (x < 0 || x >= W || y < 0 || y >= H || a <= 0) return;
+  const i = (y * W + x) * 4;
+  const sa = a > 1 ? 1 : a;
+  const da = buf[i + 3] / 255;
+  const outA = sa + da * (1 - sa);
+  if (outA <= 0) return;
+  buf[i] = Math.round((r * sa + buf[i] * da * (1 - sa)) / outA);
+  buf[i + 1] = Math.round((g * sa + buf[i + 1] * da * (1 - sa)) / outA);
+  buf[i + 2] = Math.round((b * sa + buf[i + 2] * da * (1 - sa)) / outA);
+  buf[i + 3] = Math.round(outA * 255);
 }
 
-// Linear interpolation between two [r,g,b] colours.
-function lerpC(c1, c2, t) {
+function setOpaque(x, y, r, g, b) {
+  if (x < 0 || x >= W || y < 0 || y >= H) return;
+  const i = (y * W + x) * 4;
+  buf[i] = r;
+  buf[i + 1] = g;
+  buf[i + 2] = b;
+  buf[i + 3] = 255;
+}
+
+// RGB helper: [r, g, b]
+function lerpColor(c1, c2, t) {
   return [
-    c1[0] + (c2[0] - c1[0]) * t,
-    c1[1] + (c2[1] - c1[1]) * t,
-    c1[2] + (c2[2] - c1[2]) * t,
+    Math.round(c1[0] + (c2[0] - c1[0]) * t),
+    Math.round(c1[1] + (c2[1] - c1[1]) * t),
+    Math.round(c1[2] + (c2[2] - c1[2]) * t),
   ];
 }
 
-// Soft radial glow: colour fades with distance from (cx,cy).
-function glow(cx, cy, rad, r, g, b, a) {
-  const x0 = Math.max(0, Math.floor(cx - rad));
-  const x1 = Math.min(W - 1, Math.ceil(cx + rad));
-  const y0 = Math.max(0, Math.floor(cy - rad));
-  const y1 = Math.min(H - 1, Math.ceil(cy + rad));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const dx = (x - cx) / rad;
-      const dy = (y - cy) / rad;
-      const d2 = dx * dx + dy * dy;
-      if (d2 >= 1) continue;
-      const fall = (1 - d2) * (1 - d2);
-      blend(x, y, r, g, b, a * fall);
-    }
-  }
-}
-
-// Solid filled disc.
-function disc(cx, cy, rad, r, g, b, a) {
-  const x0 = Math.max(0, Math.floor(cx - rad));
-  const x1 = Math.min(W - 1, Math.ceil(cx + rad));
-  const y0 = Math.max(0, Math.floor(cy - rad));
-  const y1 = Math.min(H - 1, Math.ceil(cy + rad));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const dx = (x - cx) / rad;
-      const dy = (y - cy) / rad;
-      if (dx * dx + dy * dy <= 1) blend(x, y, r, g, b, a);
-    }
-  }
-}
-
-// Filled rotated ellipse.
-function ellipse(cx, cy, rx, ry, rot, r, g, b, a) {
-  const cos = Math.cos(rot);
-  const sin = Math.sin(rot);
-  const rad = Math.max(rx, ry);
-  const x0 = Math.max(0, Math.floor(cx - rad));
-  const x1 = Math.min(W - 1, Math.ceil(cx + rad));
-  const y0 = Math.max(0, Math.floor(cy - rad));
-  const y1 = Math.min(H - 1, Math.ceil(cy + rad));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      const dx = x - cx;
-      const dy = y - cy;
-      const u = (dx * cos + dy * sin) / rx;
-      const v = (-dx * sin + dy * cos) / ry;
-      if (u * u + v * v <= 1) blend(x, y, r, g, b, a);
-    }
-  }
-}
-
-// Filled polygon (scanline via point-in-polygon test over its bounding box).
-function poly(pts, r, g, b, a) {
-  let x0 = W;
-  let x1 = 0;
-  let y0 = H;
-  let y1 = 0;
-  for (const p of pts) {
-    if (p[0] < x0) x0 = p[0];
-    if (p[0] > x1) x1 = p[0];
-    if (p[1] < y0) y0 = p[1];
-    if (p[1] > y1) y1 = p[1];
-  }
-  x0 = Math.max(0, Math.floor(x0));
-  x1 = Math.min(W - 1, Math.ceil(x1));
-  y0 = Math.max(0, Math.floor(y0));
-  y1 = Math.min(H - 1, Math.ceil(y1));
-  for (let y = y0; y <= y1; y++) {
-    for (let x = x0; x <= x1; x++) {
-      let inside = false;
-      for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) {
-        const xi = pts[i][0];
-        const yi = pts[i][1];
-        const xj = pts[j][0];
-        const yj = pts[j][1];
-        if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
-          inside = !inside;
-        }
-      }
-      if (inside) blend(x, y, r, g, b, a);
-    }
-  }
-}
-
-// Thick line as a chain of discs.
-function thickLine(x0, y0, x1, y1, w, r, g, b, a) {
-  const dx = x1 - x0;
-  const dy = y1 - y0;
-  const len = Math.hypot(dx, dy);
-  const steps = Math.max(1, Math.ceil(len / (w * 0.4)));
-  for (let i = 0; i <= steps; i++) {
-    const t = i / steps;
-    disc(x0 + dx * t, y0 + dy * t, w / 2, r, g, b, a);
-  }
-}
-
-// Filled rectangle.
-function rect(x0, y0, x1, y1, r, g, b, a) {
+function fillRect(x0, y0, x1, y1, c, a = 1) {
   const xa = Math.max(0, Math.floor(x0));
   const xb = Math.min(W - 1, Math.ceil(x1));
   const ya = Math.max(0, Math.floor(y0));
   const yb = Math.min(H - 1, Math.ceil(y1));
   for (let y = ya; y <= yb; y++) {
-    for (let x = xa; x <= xb; x++) blend(x, y, r, g, b, a);
+    for (let x = xa; x <= xb; x++) blendPixel(x, y, c[0], c[1], c[2], a);
   }
 }
 
-// ---- palette ----
-const INDIGO_TOP = [10, 8, 42];
-const INDIGO_MID = [38, 20, 88];
-const VIOLET = [96, 32, 120];
-const MAGENTA_GLOW = [214, 44, 150];
-const CYAN = [46, 226, 238];
-const GOLD = [255, 190, 60];
-const GOLD_DEEP = [232, 130, 24];
-const CRIMSON = [214, 32, 52];
-const EMBER = [255, 110, 30];
-const CREAM = [255, 236, 180];
-
-// ============ 1. SKY — deep indigo to violet, with a magenta horizon band ============
-const skyStops = [
-  [0.0, INDIGO_TOP],
-  [0.38, INDIGO_MID],
-  [0.62, VIOLET],
-  [0.78, [150, 40, 110]],
-  [1.0, [70, 22, 80]],
-];
-for (let y = 0; y < H; y++) {
-  const t = y / (H - 1);
-  let c = skyStops[skyStops.length - 1][1];
-  for (let s = 0; s < skyStops.length - 1; s++) {
-    const t0 = skyStops[s][0];
-    const t1 = skyStops[s + 1][0];
-    if (t >= t0 && t <= t1) {
-      c = lerpC(skyStops[s][1], skyStops[s + 1][1], (t - t0) / (t1 - t0));
-      break;
+function fillCircle(cx, cy, r, c, a = 1) {
+  const xa = Math.max(0, Math.floor(cx - r));
+  const xb = Math.min(W - 1, Math.ceil(cx + r));
+  const ya = Math.max(0, Math.floor(cy - r));
+  const yb = Math.min(H - 1, Math.ceil(cy + r));
+  const r2 = r * r;
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) {
+      const dx = x - cx;
+      const dy = y - cy;
+      if (dx * dx + dy * dy <= r2) blendPixel(x, y, c[0], c[1], c[2], a);
     }
   }
-  for (let x = 0; x < W; x++) setPx(x, y, c[0], c[1], c[2]);
 }
 
-// Stars: tiny bright dots, denser and brighter up top.
-for (let i = 0; i < 260; i++) {
-  const x = rr(0, W);
-  const y = rr(0, 620);
-  const s = rr(0.5, 2.1);
-  const bright = rr(120, 255);
-  const warm = rnd() < 0.3;
-  disc(x, y, s, bright, warm ? bright * 0.85 : bright, warm ? bright * 0.6 : 255, rr(0.35, 0.95));
-}
-// A few cross sparkle stars.
-for (let i = 0; i < 14; i++) {
-  const x = rr(40, W - 40);
-  const y = rr(30, 420);
-  const l = rr(5, 12);
-  const b = rr(180, 255);
-  thickLine(x - l, y, x + l, y, 1.4, b, b, 255, 0.8);
-  thickLine(x, y - l, x, y + l, 1.4, b, b, 255, 0.8);
-}
-
-// Distant magenta city glow on the horizon.
-glow(512, 760, 620, 214, 44, 150, 0.35);
-glow(180, 780, 300, 46, 226, 238, 0.18);
-glow(860, 780, 300, 255, 140, 40, 0.16);
-
-// ============ 2. NEON CITY — three depth layers of silhouettes ============
-function cityLayer(yBase, hMin, hMax, col, winAlpha, neonChance) {
-  let x = -20;
-  while (x < W + 20) {
-    const bw = rr(46, 120);
-    const bh = rr(hMin, hMax);
-    const top = yBase - bh;
-    rect(x, top, x + bw, yBase, col[0], col[1], col[2], 1);
-    // Rooftop antenna / spire on some towers.
-    if (rnd() < 0.35) {
-      const ax = x + bw * rr(0.3, 0.7);
-      thickLine(ax, top, ax, top - rr(14, 42), 3, col[0], col[1], col[2], 1);
-      disc(ax, top - rr(14, 42), 3, 255, 80, 90, 0.9);
+// Soft radial glow: brightness falls off quadratically to radius r.
+function glow(cx, cy, r, c, peak) {
+  const xa = Math.max(0, Math.floor(cx - r));
+  const xb = Math.min(W - 1, Math.ceil(cx + r));
+  const ya = Math.max(0, Math.floor(cy - r));
+  const yb = Math.min(H - 1, Math.ceil(cy + r));
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) {
+      const dx = (x - cx) / r;
+      const dy = (y - cy) / r;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= 1) continue;
+      const fall = (1 - d2) * (1 - d2);
+      blendPixel(x, y, c[0], c[1], c[2], peak * fall);
     }
-    // Lit windows.
-    const cols = Math.floor(bw / 16);
-    const rows = Math.floor(bh / 22);
-    for (let cx = 0; cx < cols; cx++) {
-      for (let cy = 0; cy < rows; cy++) {
-        if (rnd() < 0.42) {
-          const wx = x + 7 + cx * 16;
-          const wy = top + 10 + cy * 22;
-          const warm = rnd();
-          if (warm < 0.55) rect(wx, wy, wx + 7, wy + 10, 255, 196, 110, winAlpha);
-          else if (warm < 0.8) rect(wx, wy, wx + 7, wy + 10, 90, 230, 240, winAlpha);
-          else rect(wx, wy, wx + 7, wy + 10, 255, 90, 150, winAlpha);
-        }
+  }
+}
+
+// Filled ellipse, optionally rotated (degrees), via bounding-box test.
+function ellipse(cx, cy, rx, ry, rotDeg, c, a = 1) {
+  const rot = (rotDeg * Math.PI) / 180;
+  const cos = Math.cos(rot);
+  const sin = Math.sin(rot);
+  const R = Math.max(rx, ry);
+  const xa = Math.max(0, Math.floor(cx - R));
+  const xb = Math.min(W - 1, Math.ceil(cx + R));
+  const ya = Math.max(0, Math.floor(cy - R));
+  const yb = Math.min(H - 1, Math.ceil(cy + R));
+  for (let y = ya; y <= yb; y++) {
+    for (let x = xa; x <= xb; x++) {
+      const dx = x - cx;
+      const dy = y - cy;
+      const lx = dx * cos + dy * sin;
+      const ly = -dx * sin + dy * cos;
+      const v = (lx * lx) / (rx * rx) + (ly * ly) / (ry * ry);
+      if (v <= 1) blendPixel(x, y, c[0], c[1], c[2], a);
+    }
+  }
+}
+
+// Scanline polygon fill.
+function polygon(pts, c, a = 1) {
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    if (p[1] < minY) minY = p[1];
+    if (p[1] > maxY) maxY = p[1];
+  }
+  const y0 = Math.max(0, Math.floor(minY));
+  const y1 = Math.min(H - 1, Math.ceil(maxY));
+  for (let y = y0; y <= y1; y++) {
+    const xs = [];
+    for (let i = 0; i < pts.length; i++) {
+      const p1 = pts[i];
+      const p2 = pts[(i + 1) % pts.length];
+      if ((p1[1] <= y && p2[1] > y) || (p2[1] <= y && p1[1] > y)) {
+        const t = (y - p1[1]) / (p2[1] - p1[1]);
+        xs.push(p1[0] + t * (p2[0] - p1[0]));
       }
     }
-    // Neon strip on some rooftops.
-    if (rnd() < neonChance) {
-      const nc = pick([[255, 45, 170], [46, 226, 238], [255, 190, 60], [140, 90, 255]]);
-      rect(x + 4, top - 4, x + bw - 4, top - 1, nc[0], nc[1], nc[2], 0.95);
-      glow(x + bw / 2, top - 2, bw * 0.6, nc[0], nc[1], nc[2], 0.22);
-    }
-    x += bw + rr(2, 18);
-  }
-}
-// Far layer (hazy violet), mid layer, near layer (near-black).
-cityLayer(1024, 150, 260, [52, 30, 96], 0.5, 0.25);
-cityLayer(1024, 190, 330, [28, 16, 58], 0.7, 0.4);
-cityLayer(1024, 240, 400, [12, 8, 30], 0.9, 0.55);
-// Wet-street reflection shimmer at the very bottom.
-for (let i = 0; i < 90; i++) {
-  const x = rr(0, W);
-  const y = rr(960, 1023);
-  const len = rr(14, 70);
-  const c = pick([[255, 45, 170], [46, 226, 238], [255, 190, 60]]);
-  rect(x, y, x + rr(2, 5), y + len * 0.18, c[0], c[1], c[2], rr(0.12, 0.4));
-}
-
-// ============ 3. THE FRAMED PAINTING — gilt frame, calm painted world inside ============
-const FX0 = 268;
-const FX1 = 756;
-const FY0 = 148;
-const FY1 = 566;
-// Halo glow behind the whole frame so it lifts off the sky.
-glow(512, 360, 330, 255, 170, 60, 0.28);
-glow(512, 360, 200, 255, 120, 40, 0.3);
-
-// Painting interior: a serene painted dawn sky + lake + mountains.
-const paintStops = [
-  [0.0, [250, 190, 110]],
-  [0.35, [240, 130, 80]],
-  [0.62, [150, 70, 110]],
-  [1.0, [60, 40, 110]],
-];
-for (let y = FY0 + 16; y <= FY1 - 16; y++) {
-  const t = (y - FY0) / (FY1 - FY0);
-  let c = paintStops[paintStops.length - 1][1];
-  for (let s = 0; s < paintStops.length - 1; s++) {
-    if (t >= paintStops[s][0] && t <= paintStops[s + 1][0]) {
-      c = lerpC(paintStops[s][1], paintStops[s + 1][1], (t - paintStops[s][0]) / (paintStops[s + 1][0] - paintStops[s][0]));
-      break;
+    xs.sort((m, n) => m - n);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const xa = Math.max(0, Math.floor(xs[k]));
+      const xb = Math.min(W - 1, Math.ceil(xs[k + 1]));
+      for (let x = xa; x <= xb; x++) blendPixel(x, y, c[0], c[1], c[2], a);
     }
   }
-  for (let x = FX0 + 16; x <= FX1 - 16; x++) setPx(x, y, c[0], c[1], c[2]);
-}
-// Painted sun low in the painting.
-glow(512, 470, 90, 255, 220, 130, 0.9);
-disc(512, 470, 34, 255, 226, 150, 1);
-// Painted mountains (two ridges) and a lake band.
-poly([[FX0 + 16, 520], [380, 430], [470, 500], [560, 440], [660, 510], [FX1 - 16, 460], [FX1 - 16, 566], [FX0 + 16, 566]], 74, 52, 110, 1);
-poly([[FX0 + 16, 566], [FX1 - 16, 566], [FX1 - 16, 520], [660, 540], [512, 522], [360, 545]], 40, 30, 84, 1);
-// Painted clouds.
-for (const [cx, cy, s] of [[360, 250, 1], [640, 220, 1.2], [470, 300, 0.8], [600, 330, 0.7]]) {
-  glow(cx, cy, 52 * s, 255, 210, 170, 0.5);
-  ellipse(cx, cy, 58 * s, 16 * s, 0, 255, 220, 185, 0.85);
-  ellipse(cx - 34 * s, cy + 6, 34 * s, 11 * s, 0, 255, 220, 185, 0.8);
-  ellipse(cx + 36 * s, cy + 7, 36 * s, 12 * s, 0, 255, 220, 185, 0.8);
 }
 
-// Gilt frame: outer gold, inner bevel, dark inner lip.
-// The TOP edge is broken open in the middle where the phoenix bursts through.
-function goldBar(x0, y0, x1, y1) {
-  rect(x0, y0, x1, y1, 176, 128, 34, 1);
-  rect(x0, y0, x1, y0 + 4, 255, 214, 110, 0.95);
-  rect(x0, y0 + 5, x1, y0 + 9, 120, 84, 20, 0.9);
-  rect(x0, y1 - 4, x1, y1, 255, 214, 110, 0.95);
-}
-// Left, right, bottom bars (whole).
-goldBar(FX0, FY0, FX0 + 18, FY1);
-goldBar(FX1 - 18, FY0, FX1, FY1);
-goldBar(FX0, FY1 - 18, FX1, FY1);
-// Top bar in two pieces with a burst gap in the middle (x 430..594).
-goldBar(FX0, FY0, 430, FY0 + 18);
-goldBar(594, FY0, FX1, FY0 + 18);
-// Frame corner rosettes.
-for (const [cx, cy] of [[FX0 + 9, FY0 + 9], [FX1 - 9, FY0 + 9], [FX0 + 9, FY1 - 9], [FX1 - 9, FY1 - 9]]) {
-  disc(cx, cy, 8, 255, 214, 110, 1);
-  disc(cx, cy, 4, 140, 96, 24, 1);
-}
-// Torn top-edge shards still attached, tilted outward.
-poly([[430, FY0 + 18], [452, FY0 - 26], [478, FY0 + 14]], 220, 164, 60, 1);
-poly([[594, FY0 + 18], [576, FY0 - 20], [548, FY0 + 12]], 200, 148, 52, 1);
-poly([[452, FY0 - 26], [470, FY0 - 44], [486, FY0 - 18]], 255, 214, 110, 1);
-
-// ============ 4. THE PHOENIX — tail, wings, body, head, crest ============
-// Big warm glow behind the bird so it burns against the indigo sky.
-glow(512, 330, 260, 255, 140, 30, 0.5);
-glow(512, 330, 150, 255, 200, 90, 0.55);
-
-// --- Tail: long flowing plumes sweeping down over the frame's bottom edge ---
-const tailCols = [
-  [255, 190, 60],
-  [255, 140, 40],
-  [232, 80, 30],
-  [214, 32, 52],
-  [255, 110, 30],
-];
-for (let i = 0; i < 9; i++) {
-  const spread = (i - 4) * 26;
-  const cx = 512 + spread;
-  const len = 300 - Math.abs(i - 4) * 22;
-  const topY = 430;
-  const botY = topY + len;
-  const sway = spread * 0.55;
-  const col = tailCols[i % tailCols.length];
-  // Plume as a tapered ribbon of overlapping ellipses.
-  const steps = 14;
-  for (let s2 = 0; s2 <= steps; s2++) {
-    const t = s2 / steps;
-    const px2 = cx + sway * t * t + Math.sin(t * 3.1 + i) * 8 * t;
-    const py = topY + (botY - topY) * t;
-    const wdt = 26 * (1 - t * 0.55);
-    ellipse(px2, py, wdt, 34, sway * 0.0016 + Math.sin(t * 2 + i) * 0.25, col[0], col[1], col[2], 0.95);
+// Thick line as a chain of circles.
+function thickLine(x0, y0, x1, y1, w, c, a = 1) {
+  const steps = Math.max(2, Math.ceil(Math.hypot(x1 - x0, y1 - y0)));
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    fillCircle(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, w / 2, c, a);
   }
-  // Glowing eye-spot near the tip of each plume.
-  const tipX = cx + sway + Math.sin(3.1 + i) * 8;
-  const tipY = botY - 26;
-  glow(tipX, tipY, 22, 255, 200, 80, 0.4);
-  ellipse(tipX, tipY, 10, 16, 0.2, 255, 220, 120, 0.95);
-  ellipse(tipX, tipY, 5, 8, 0.2, 160, 24, 44, 0.9);
 }
 
-// --- Wings: three rows of fanned feathers, left and right, breaking past the frame ---
-function wing(side) {
-  // side: -1 left, +1 right. Wing root at the body, tip sweeping up-out.
-  const rootX = 512 + side * 26;
-  const rootY = 360;
-  // Back row (longest, darkest crimson), mid row (orange), front row (gold).
-  const rows = [
-    { n: 6, len: 310, col: [176, 22, 44], w: 30, baseAng: 0.3 },
-    { n: 6, len: 262, col: [232, 90, 26], w: 27, baseAng: 0.22 },
-    { n: 5, len: 210, col: [255, 176, 52], w: 24, baseAng: 0.14 },
+// Quadratic bezier point.
+function quad(p0, p1, p2, t) {
+  const u = 1 - t;
+  return [
+    u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0],
+    u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1],
   ];
-  for (let ri = 0; ri < rows.length; ri++) {
-    const row = rows[ri];
-    for (let f = 0; f < row.n; f++) {
-      const t = f / (row.n - 1); // 0 = upper/outer, 1 = lower/inner
-      const ang = side * (row.baseAng + t * 0.85); // fan angle from vertical
-      const L = row.len * (1 - t * 0.3);
-      // Feather direction: outward and upward for upper feathers, outward-down for lower.
-      const dirX = Math.sin(ang);
-      const dirY = -Math.cos(ang) * (t < 0.45 ? 1 : 0.4) + t * 0.45;
-      const tipX = rootX + dirX * L * 0.92;
-      const tipY = rootY + dirY * L * 0.92;
-      const midX = (rootX + tipX) / 2;
-      const midY = (rootY + tipY) / 2;
-      const rot = Math.atan2(tipY - rootY, tipX - rootX) + Math.PI / 2;
-      // Feather body: layered ellipses along its length.
-      for (let s2 = 0; s2 <= 5; s2++) {
-        const u = s2 / 5;
-        const fx = rootX + (tipX - rootX) * u;
-        const fy = rootY + (tipY - rootY) * u;
-        const fw = row.w * (1 - u * 0.45);
-        ellipse(fx, fy, fw, 30, rot, row.col[0], row.col[1], row.col[2], 0.96);
-      }
-      // Bright leading edge + glowing tip.
-      ellipse(midX, midY, row.w * 0.55, 26, rot, 255, 200, 90, 0.5);
-      glow(tipX, tipY, 22, 255, 180, 60, 0.45);
-      disc(tipX, tipY, 5, 255, 220, 130, 0.95);
-    }
-  }
 }
-wing(-1);
-wing(1);
 
-// --- Body: golden torso, chest forward, glowing ---
-ellipse(512, 384, 60, 88, 0, 255, 176, 52, 1);
-ellipse(512, 396, 46, 70, 0, 255, 205, 100, 1);
-ellipse(512, 408, 30, 50, 0, 255, 232, 160, 1);
-glow(512, 384, 96, 255, 180, 60, 0.4);
-// Belly feather scallops.
-for (let r2 = 0; r2 < 3; r2++) {
-  for (let c2 = -2; c2 <= 2; c2++) {
-    const ex = 512 + c2 * 20;
-    const ey = 362 + r2 * 24;
-    ellipse(ex, ey, 13, 10, 0, 232, 130, 24, 0.35);
+// Tapering bezier stroke: width shrinks from w0 to w1 along the curve.
+function taperCurve(p0, p1, p2, w0, w1, c, a = 1) {
+  const steps = 90;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const [x, y] = quad(p0, p1, p2, t);
+    const w = w0 + (w1 - w0) * t;
+    fillCircle(x, y, Math.max(0.6, w / 2), c, a);
   }
 }
 
-// --- Head + beak + crest, thrown back in a cry toward the sky ---
-ellipse(512, 262, 42, 48, -0.12, 255, 196, 70, 1);
-ellipse(524, 272, 27, 31, 0, 255, 220, 130, 1);
-// Beak open, pointing up.
-poly([[532, 236], [576, 206], [540, 258]], 255, 150, 40, 1);
-poly([[532, 246], [568, 230], [538, 264]], 120, 40, 20, 1);
-// Eye: fierce, bright.
-disc(532, 252, 9, 255, 240, 200, 1);
-disc(533, 252, 5, 20, 8, 8, 1);
-disc(535, 250, 2, 255, 255, 255, 1);
-// Crest: three flame plumes streaming back from the crown.
-for (let i = 0; i < 3; i++) {
-  const bx = 498 - i * 12;
-  const by = 224 - i * 4;
-  poly([[bx, by], [bx - 40 - i * 14, by - 60 - i * 12], [bx + 10, by - 34]], [255, 176 - i * 30, 52][0], 176 - i * 30, 52, 1);
-  glow(bx - 24 - i * 8, by - 38, 22, 255, 170, 60, 0.5);
-}
-// Neck ruff.
-for (let i = 0; i < 7; i++) {
-  const a = -0.5 + i * 0.17;
-  ellipse(512 + Math.sin(a) * 34, 306 + Math.cos(a) * 10, 12, 20, a, 255, 140, 40, 0.9);
-}
-
-// ============ 5. SHATTERED FRAME SHARDS + EMBERS flying at the viewer ============
-// Gold frame shards bursting outward from the broken top edge.
-const shardCols = [[255, 214, 110], [220, 164, 60], [176, 128, 34], [255, 190, 80]];
-for (let i = 0; i < 26; i++) {
-  const a = rr(-Math.PI * 0.85, -Math.PI * 0.15);
-  const d = rr(60, 260);
-  const cx = 512 + Math.cos(a) * d;
-  const cy = 160 + Math.sin(a) * d * 0.8;
-  const s = rr(6, 22);
-  const rot = rr(0, Math.PI);
-  const c = pick(shardCols);
-  poly(
-    [
-      [cx + Math.cos(rot) * s, cy + Math.sin(rot) * s],
-      [cx + Math.cos(rot + 2.1) * s * 0.7, cy + Math.sin(rot + 2.1) * s * 0.7],
-      [cx + Math.cos(rot + 4.2) * s * 0.8, cy + Math.sin(rot + 4.2) * s * 0.8],
-    ],
-    c[0],
-    c[1],
-    c[2],
-    0.95
-  );
-}
-// Ember storm: hundreds of glowing sparks radiating from the phoenix.
-for (let i = 0; i < 420; i++) {
-  const a = rr(0, Math.PI * 2);
-  const d = Math.pow(rnd(), 0.6) * 520;
-  const x = 512 + Math.cos(a) * d;
-  const y = 340 + Math.sin(a) * d * 0.85;
-  const s = rr(1, 4.2);
-  const heat = rnd();
-  const col = heat < 0.5 ? [255, 200, 80] : heat < 0.85 ? [255, 120, 30] : [255, 70, 40];
-  glow(x, y, s * 3.2, col[0], col[1], col[2], 0.55);
-  disc(x, y, s, col[0], col[1], col[2], 0.95);
-  // A few embers get motion streaks pointing away from the bird.
-  if (rnd() < 0.22) {
-    const dx = Math.cos(a);
-    const dy = Math.sin(a);
-    thickLine(x - dx * 14, y - dy * 14, x + dx * 10, y + dy * 10, 2, col[0], col[1], col[2], 0.7);
+// ---------------------------------------------------------------------------
+// PNG encoder: IHDR / IDAT (zlib deflate, filter 0) / IEND, CRC32.
+// ---------------------------------------------------------------------------
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
   }
-}
-// Foreground sparks, big and close, bottom corners.
-for (let i = 0; i < 26; i++) {
-  const x = rnd() < 0.5 ? rr(0, 260) : rr(764, 1024);
-  const y = rr(560, 1024);
-  const s = rr(2.5, 6);
-  glow(x, y, s * 4, 255, 170, 60, 0.5);
-  disc(x, y, s, 255, 210, 110, 0.95);
-}
+  return table;
+})();
 
-// ============ 6. SPEED LINES + VIGNETTE ============
-// Diagonal speed lines streaking past the wings.
-for (let i = 0; i < 22; i++) {
-  const side = rnd() < 0.5 ? -1 : 1;
-  const x = 512 + side * rr(260, 500);
-  const y = rr(60, 640);
-  const len = rr(24, 70);
-  const a = side > 0 ? 0.5 : Math.PI - 0.5;
-  thickLine(x, y, x + Math.cos(a) * len, y + Math.sin(a) * len, rr(1.5, 3), 255, 220, 160, rr(0.1, 0.28));
-}
-// Vignette: darken the corners so the centre burns.
-for (let y = 0; y < H; y++) {
-  for (let x = 0; x < W; x++) {
-    const dx = (x - 512) / 512;
-    const dy = (y - 470) / 520;
-    const d2 = dx * dx + dy * dy;
-    if (d2 > 0.75) {
-      const a = Math.min(0.42, (d2 - 0.75) * 0.55);
-      blend(x, y, 4, 2, 18, a);
-    }
-  }
-}
-
-// ============ PNG ENCODER (zlib deflate + chunks + CRC32) ============
-const CRC_TABLE = new Int32Array(256);
-for (let n = 0; n < 256; n++) {
-  let c = n;
-  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  CRC_TABLE[n] = c;
-}
-function crc32(buf) {
+function crc32(bytes) {
   let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  for (let i = 0; i < bytes.length; i++) {
+    c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  }
   return (c ^ 0xffffffff) >>> 0;
 }
+
 function chunk(type, data) {
   const out = Buffer.alloc(8 + data.length + 4);
   out.writeUInt32BE(data.length, 0);
   out.write(type, 4, "ascii");
   data.copy(out, 8);
-  const crcBuf = Buffer.concat([Buffer.from(type, "ascii"), data]);
-  out.writeUInt32BE(crc32(crcBuf), 8 + data.length);
+  out.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type, "ascii"), data])), 8 + data.length);
   return out;
 }
 
-// Raw scanlines: filter byte 0 + RGB triplets per row.
-const raw = Buffer.alloc(H * (1 + W * 3));
-for (let y = 0; y < H; y++) {
-  raw[y * (1 + W * 3)] = 0;
-  px.copy(raw, y * (1 + W * 3) + 1, y * W * 3, (y + 1) * W * 3);
+function encodePNG() {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(W, 0);
+  ihdr.writeUInt32BE(H, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // color type RGBA
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+  const raw = Buffer.alloc(H * (1 + W * 4));
+  for (let y = 0; y < H; y++) {
+    raw[y * (1 + W * 4)] = 0; // filter: none
+    raw.set(buf.subarray(y * W * 4, (y + 1) * W * 4), y * (1 + W * 4) + 1);
+  }
+  const idat = zlib.deflateSync(raw, { level: 9 });
+  const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return Buffer.concat([
+    sig,
+    chunk("IHDR", ihdr),
+    chunk("IDAT", idat),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
 }
-const idat = zlib.deflateSync(raw, { level: 9 });
-const ihdr = Buffer.alloc(13);
-ihdr.writeUInt32BE(W, 0);
-ihdr.writeUInt32BE(H, 4);
-ihdr[8] = 8; // bit depth
-ihdr[9] = 2; // colour type 2 = RGB
-ihdr[10] = 0; // compression
-ihdr[11] = 0; // filter
-ihdr[12] = 0; // interlace
-const png = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-  chunk("IHDR", ihdr),
-  chunk("IDAT", idat),
-  chunk("IEND", Buffer.alloc(0)),
-]);
 
-fs.mkdirSync(OUT_DIR, { recursive: true });
-fs.writeFileSync(OUT_PATH, png);
-console.log("wrote " + OUT_PATH + " (" + png.length + " bytes, " + W + "x" + H + ")");
+// ---------------------------------------------------------------------------
+// Palette
+// ---------------------------------------------------------------------------
+const INK = [8, 8, 34];
+const INDIGO = [24, 16, 68];
+const VIOLET = [64, 28, 110];
+const MAGENTA = [255, 45, 149];
+const CYAN = [0, 229, 255];
+const GOLD = [255, 200, 60];
+const GOLD_DEEP = [214, 148, 16];
+const GOLD_DARK = [139, 101, 8];
+const EMBER = [255, 110, 20];
+const CRIMSON = [220, 30, 60];
+const FLAME = [255, 140, 40];
+const CREAM = [255, 240, 200];
+
+// ---------------------------------------------------------------------------
+// 1. Night sky: three-stop vertical gradient + stars + horizon glow.
+// ---------------------------------------------------------------------------
+function drawSky() {
+  const top = [6, 6, 30];
+  const mid = [22, 14, 66];
+  const low = [58, 20, 96];
+  for (let y = 0; y < H; y++) {
+    const t = y / H;
+    let c;
+    if (t < 0.55) c = lerpColor(top, mid, t / 0.55);
+    else c = lerpColor(mid, low, (t - 0.55) / 0.45);
+    for (let x = 0; x < W; x++) setOpaque(x, y, c[0], c[1], c[2]);
+  }
+  // Wide magenta glow low over the city, cyan glow to the left.
+  glow(512, 760, 620, MAGENTA, 0.30);
+  glow(150, 700, 420, CYAN, 0.22);
+  glow(880, 720, 380, [255, 120, 40], 0.18);
+
+  // Stars.
+  for (let i = 0; i < 260; i++) {
+    const x = rr(0, W);
+    const y = rr(0, 640);
+    const r = rr(0.6, 2.1);
+    const b = rr(0.35, 1);
+    const c = pick([[255, 255, 255], [255, 255, 255], [200, 220, 255], [255, 230, 180]]);
+    fillCircle(x, y, r, c, b);
+    if (r > 1.6) glow(x, y, r * 5, c, 0.35);
+  }
+  // A few bright cross-sparkle stars.
+  for (let i = 0; i < 10; i++) {
+    const x = rr(40, W - 40);
+    const y = rr(30, 420);
+    const s = rr(4, 9);
+    thickLine(x - s, y, x + s, y, 1.2, [255, 255, 255], 0.8);
+    thickLine(x, y - s, x, y + s, 1.2, [255, 255, 255], 0.8);
+    fillCircle(x, y, 1.8, [255, 255, 255], 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Neon city skyline along the bottom, two depth layers.
+// ---------------------------------------------------------------------------
+function drawCityLayer(baseY, topMin, topMax, body, windowColors, winChance) {
+  let x = -20;
+  while (x < W + 20) {
+    const w = rr(46, 120);
+    const top = rr(topMin, topMax);
+    fillRect(x, top, x + w, H, body, 1);
+    // Rooftop antenna on some towers.
+    if (rand() < 0.35) {
+      const ax = x + w * rr(0.3, 0.7);
+      thickLine(ax, top, ax, top - rr(14, 42), 3, body, 1);
+      fillCircle(ax, top - rr(14, 42), 3, [255, 60, 80], 0.9);
+    }
+    // Neon rim light on the roof edge.
+    if (rand() < 0.6) {
+      fillRect(x, top, x + w, top + 3, pick([MAGENTA, CYAN, GOLD]), rr(0.5, 0.9));
+    }
+    // Lit windows in a grid.
+    const cols = Math.floor(w / 16);
+    const rows = Math.floor((baseY - top) / 22);
+    for (let cx = 0; cx < cols; cx++) {
+      for (let cy = 0; cy < rows; cy++) {
+        if (rand() < winChance) {
+          const wx = x + 6 + cx * 16;
+          const wy = top + 10 + cy * 22;
+          fillRect(wx, wy, wx + 8, wy + 11, pick(windowColors), rr(0.55, 1));
+        }
+      }
+    }
+    x += w + rr(2, 18);
+  }
+}
+
+function drawCity() {
+  drawCityLayer(1024, 600, 730, [16, 12, 52], [[255, 45, 149], [0, 229, 255], [255, 200, 90]], 0.16);
+  drawCityLayer(1024, 730, 880, [7, 6, 26], [[255, 45, 149], [0, 229, 255], [255, 210, 110], [255, 255, 255]], 0.34);
+  // Wet-street glow band at the very bottom.
+  glow(512, 1010, 500, MAGENTA, 0.16);
+  glow(300, 1020, 300, CYAN, 0.14);
+}
+
+// ---------------------------------------------------------------------------
+// 3. The gilt frame and the painting inside it.
+//    Frame outer: x 212..812, y 150..720. Bar thickness 26.
+//    The top bar is broken open in the middle (gap x 438..592).
+// ---------------------------------------------------------------------------
+const FRAME = { x0: 212, y0: 150, x1: 812, y1: 720, bar: 26 };
+
+function drawPainting() {
+  const ix0 = FRAME.x0 + FRAME.bar;
+  const iy0 = FRAME.y0 + FRAME.bar;
+  const ix1 = FRAME.x1 - FRAME.bar;
+  const iy1 = FRAME.y1 - FRAME.bar;
+  // Sunset gradient inside the painting.
+  const stops = [
+    [52, 18, 92],
+    [122, 30, 96],
+    [214, 80, 40],
+    [255, 176, 66],
+  ];
+  for (let y = iy0; y <= iy1; y++) {
+    const t = (y - iy0) / (iy1 - iy0);
+    const seg = Math.min(2, Math.floor(t * 3));
+    const lt = t * 3 - seg;
+    const c = lerpColor(stops[seg], stops[seg + 1], lt);
+    for (let x = ix0; x <= ix1; x++) setOpaque(x, y, c[0], c[1], c[2]);
+  }
+  // Low sun.
+  glow(512, 560, 150, [255, 220, 120], 0.9);
+  fillCircle(512, 560, 52, [255, 236, 170], 1);
+  fillCircle(512, 560, 38, [255, 248, 220], 1);
+  // Mountain silhouettes, two ridges.
+  const ridge = (baseY, amp, col) => {
+    const pts = [[ix0, iy1]];
+    let x = ix0;
+    while (x < ix1) {
+      pts.push([x, baseY - rr(0, amp)]);
+      x += rr(40, 110);
+    }
+    pts.push([ix1, iy1]);
+    polygon(pts, col, 1);
+  };
+  ridge(560, 90, [74, 28, 88]);
+  ridge(620, 70, [38, 16, 62]);
+  // Painted birds.
+  for (let i = 0; i < 5; i++) {
+    const bx = rr(ix0 + 40, ix1 - 40);
+    const by = rr(iy0 + 60, iy0 + 200);
+    const s = rr(6, 12);
+    thickLine(bx - s, by, bx, by - s * 0.5, 2, [30, 12, 50], 0.9);
+    thickLine(bx, by - s * 0.5, bx + s, by, 2, [30, 12, 50], 0.9);
+  }
+}
+
+function goldBar(x0, y0, x1, y1) {
+  fillRect(x0, y0, x1, y1, GOLD_DEEP, 1);
+  fillRect(x0, y0, x1, y0 + 4, [255, 226, 120], 1); // top highlight
+  fillRect(x0, y1 - 4, x1, y1, GOLD_DARK, 1); // bottom shade
+  fillRect(x0, y0, x0 + 4, y1, [255, 226, 120], 0.8);
+  fillRect(x1 - 4, y0, x1, y1, GOLD_DARK, 0.8);
+  // Inner bevel line.
+  fillRect(x0 + 7, y0 + 7, x1 - 7, y0 + 9, GOLD_DARK, 0.7);
+}
+
+function drawFrame() {
+  const { x0, y0, x1, y1, bar } = FRAME;
+  // Outer glow so the frame pops against the night.
+  glow(512, 435, 420, GOLD, 0.12);
+  // Bottom, left, right bars whole; top bar in two pieces with a gap.
+  goldBar(x0, y1 - bar, x1, y1); // bottom
+  goldBar(x0, y0, x0 + bar, y1); // left
+  goldBar(x1 - bar, y0, x1, y1); // right
+  goldBar(x0, y0, 438, y0 + bar); // top-left piece
+  goldBar(592, y0, x1, y0 + bar); // top-right piece
+  // Jagged torn ends at the break.
+  polygon(
+    [[438, y0], [462, y0 + 10], [446, y0 + bar], [438, y0 + bar]],
+    GOLD_DEEP,
+    1
+  );
+  polygon(
+    [[592, y0], [570, y0 + 8], [584, y0 + bar], [592, y0 + bar]],
+    GOLD_DEEP,
+    1
+  );
+  // Bright torn-edge highlights.
+  thickLine(438, y0, 462, y0 + 10, 3, [255, 236, 150], 1);
+  thickLine(592, y0, 570, y0 + 8, 3, [255, 236, 150], 1);
+  // Ornate corner rosettes.
+  for (const [cx, cy] of [
+    [x0 + bar / 2, y0 + bar / 2],
+    [x1 - bar / 2, y0 + bar / 2],
+    [x0 + bar / 2, y1 - bar / 2],
+    [x1 - bar / 2, y1 - bar / 2],
+  ]) {
+    fillCircle(cx, cy, 11, GOLD, 1);
+    fillCircle(cx, cy, 6, CRIMSON, 1);
+    fillCircle(cx, cy, 2.5, CREAM, 1);
+  }
+}
+
+// Gold shards flying out of the broken top edge.
+function drawShards() {
+  glow(515, 130, 130, GOLD, 0.55);
+  for (let i = 0; i < 16; i++) {
+    const cx = rr(420, 620);
+    const cy = rr(28, 150);
+    const s = rr(6, 22);
+    const a = rr(0, Math.PI * 2);
+    const pts = [];
+    for (let k = 0; k < 4; k++) {
+      const ang = a + (k * Math.PI) / 2 + rr(-0.3, 0.3);
+      const rad = s * (k % 2 === 0 ? 1 : 0.45);
+      pts.push([cx + Math.cos(ang) * rad, cy + Math.sin(ang) * rad]);
+    }
+    polygon(pts, pick([GOLD, [255, 226, 120], GOLD_DEEP]), 1);
+    if (rand() < 0.5) glow(cx, cy, s * 2.2, GOLD, 0.4);
+  }
+  // A few thin gold streaks shooting upward from the break.
+  for (let i = 0; i < 7; i++) {
+    const x0 = rr(450, 580);
+    thickLine(x0, 150, x0 + rr(-70, 70), rr(20, 90), rr(1.5, 3.5), GOLD, rr(0.5, 0.9));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. The phoenix: tail plumes, wings, body, neck, head.
+//    Body centre ~(512, 440); head up-right at ~(585, 250).
+// ---------------------------------------------------------------------------
+function drawTailPlumes() {
+  // Long plumes sweep down from the body, bowing outward over the frame's
+  // bottom edge, then curling back in toward their eye-spot tips.
+  const plumes = [
+    { ctrl: [296, 620], end: [368, 812], w0: 32, w1: 10 },
+    { ctrl: [428, 700], end: [452, 842], w0: 36, w1: 12 },
+    { ctrl: [586, 700], end: [580, 842], w0: 36, w1: 12 },
+    { ctrl: [716, 620], end: [664, 812], w0: 32, w1: 10 },
+  ];
+  const cols = [CRIMSON, [255, 90, 30], GOLD, [200, 40, 90]];
+  plumes.forEach((p, i) => {
+    const c = cols[i % cols.length];
+    taperCurve([512, 500], p.ctrl, p.end, p.w0, p.w1, c, 1);
+    taperCurve([512, 500], p.ctrl, p.end, p.w0 * 0.45, p.w1 * 0.4, GOLD, 0.75);
+    // Eye-spot near the tip: gold ring, teal centre, dark pupil.
+    const [ex, ey] = quad([512, 500], p.ctrl, p.end, 0.86);
+    glow(ex, ey, 34, CYAN, 0.5);
+    fillCircle(ex, ey, 15, GOLD, 1);
+    fillCircle(ex, ey, 10, [0, 150, 160], 1);
+    fillCircle(ex, ey, 5, [10, 10, 40], 1);
+    fillCircle(ex - 2, ey - 2, 1.8, [255, 255, 255], 1);
+  });
+}
+
+// One wing: three rows of overlapping feather ellipses fanning from the
+// shoulder. `dir` is -1 for the left wing, +1 for the right.
+function drawWing(shoulderX, shoulderY, dir) {
+  const rows = [
+    { n: 7, len: 290, wid: 40, spread: 55, baseAng: -90 },
+    { n: 6, len: 225, wid: 40, spread: 48, baseAng: -90 },
+    { n: 5, len: 160, wid: 38, spread: 38, baseAng: -90 },
+  ];
+  const tipCols = [
+    [255, 60, 90],
+    [255, 90, 40],
+    [255, 140, 40],
+    [255, 180, 50],
+  ];
+  rows.forEach((row, ri) => {
+    for (let i = 0; i < row.n; i++) {
+      const f = row.n === 1 ? 0.5 : i / (row.n - 1);
+      // Fan angle: feathers sweep from straight up outward to the wing side.
+      const angDeg = row.baseAng + dir * f * row.spread;
+      const ang = (angDeg * Math.PI) / 180;
+      // Outer (tip) feathers longest: a swept wing, not a round fan.
+      const len = row.len * (0.68 + 0.32 * f);
+      const dist = len * 0.52;
+      const cx = shoulderX + Math.cos(ang) * dist;
+      const cy = shoulderY + Math.sin(ang) * dist;
+      // Colour: gold near the body, crimson/magenta at the tips.
+      const tip = tipCols[Math.min(tipCols.length - 1, Math.floor(f * tipCols.length))];
+      const col = lerpColor(GOLD, tip, 0.35 + 0.55 * (ri / 2) + 0.1 * f);
+      // Feather ellipse, long axis along the fan direction.
+      const rot = angDeg + 90;
+      // Dark rim behind the feather so neighbours separate.
+      ellipse(cx, cy, row.wid / 2 + 3, len / 2 + 5, rot, [120, 10, 30], 1);
+      ellipse(cx, cy, row.wid / 2, len / 2, rot, col, 1);
+      // Bright shaft highlight down the feather.
+      const hx = cx - Math.cos(ang) * len * 0.18;
+      const hy = cy - Math.sin(ang) * len * 0.18;
+      ellipse(hx, hy, row.wid / 5, len * 0.32, rot, [255, 226, 130], 0.55);
+      // Dark tip cap on the outer row.
+      if (ri === 0) {
+        const tx = cx + Math.cos(ang) * len * 0.42;
+        const ty = cy + Math.sin(ang) * len * 0.42;
+        ellipse(tx, ty, row.wid / 2.4, len * 0.1, rot, CRIMSON, 0.85);
+      }
+    }
+  });
+}
+
+function drawPhoenix() {
+  // Halo behind the bird.
+  glow(512, 400, 330, [255, 170, 60], 0.55);
+  glow(512, 400, 170, [255, 230, 140], 0.7);
+
+  drawTailPlumes();
+
+  // Wings behind the body.
+  drawWing(478, 430, -1);
+  drawWing(546, 430, 1);
+
+  // Body: angled teardrop, crimson over gold, bright chest.
+  ellipse(500, 468, 62, 88, -18, CRIMSON, 1);
+  ellipse(505, 472, 46, 70, -18, [255, 90, 30], 1);
+  ellipse(516, 492, 32, 50, -18, GOLD, 1);
+  ellipse(520, 506, 20, 32, -18, [255, 236, 150], 0.95);
+
+  // Neck: thick S-curve from the body up to the head, clear of the wings.
+  taperCurve([512, 400], [548, 322], [576, 274], 46, 28, [255, 110, 30], 1);
+  taperCurve([512, 400], [548, 322], [576, 274], 22, 13, GOLD, 0.9);
+
+  // Head: large, held high above the wing line, with a bright halo.
+  glow(596, 254, 70, [255, 200, 90], 0.6);
+  ellipse(594, 254, 40, 29, -18, [255, 120, 30], 1);
+  ellipse(602, 248, 27, 18, -18, GOLD, 1);
+  // Crest: three flame feathers sweeping back from the crown.
+  ellipse(568, 220, 8, 38, -38, CRIMSON, 1);
+  ellipse(581, 213, 7, 33, -18, [255, 90, 30], 1);
+  ellipse(594, 211, 6, 29, 2, GOLD, 1);
+  // Beak: gold, open, pointing up-right toward the viewer.
+  polygon(
+    [[620, 238], [662, 228], [622, 254]],
+    [255, 200, 40],
+    1
+  );
+  polygon(
+    [[620, 250], [648, 254], [618, 262]],
+    [200, 130, 10],
+    1
+  );
+  // Eye: fierce, white with dark pupil and glint.
+  fillCircle(606, 246, 7.5, [255, 255, 255], 1);
+  fillCircle(608, 246, 4, [12, 8, 20], 1);
+  fillCircle(606.5, 244.5, 1.6, [255, 255, 255], 1);
+  // Cheek ember glow.
+  glow(606, 258, 24, EMBER, 0.5);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Embers, motion streaks, vignette.
+// ---------------------------------------------------------------------------
+function drawEmbers() {
+  for (let i = 0; i < 190; i++) {
+    const x = rr(230, 800);
+    const y = rr(80, 780);
+    const r = rr(1, 3.6);
+    const c = pick([GOLD, EMBER, FLAME, [255, 200, 90], CRIMSON]);
+    fillCircle(x, y, r, c, rr(0.6, 1));
+    if (r > 2.4) glow(x, y, r * 4, c, 0.4);
+  }
+  // A rising trail of embers along each side of the bird.
+  for (let i = 0; i < 40; i++) {
+    const side = i % 2 === 0 ? -1 : 1;
+    const x = 512 + side * rr(120, 320);
+    const y = rr(120, 700) - rr(0, 120);
+    fillCircle(x, y, rr(1, 2.6), pick([GOLD, EMBER]), rr(0.7, 1));
+  }
+}
+
+function drawStreaks() {
+  // Diagonal motion streaks radiating out from the phoenix.
+  for (let i = 0; i < 26; i++) {
+    const ang = rr(0, Math.PI * 2);
+    const d0 = rr(180, 320);
+    const d1 = d0 + rr(60, 180);
+    const x0 = 512 + Math.cos(ang) * d0;
+    const y0 = 420 + Math.sin(ang) * d0;
+    const x1 = 512 + Math.cos(ang) * d1;
+    const y1 = 420 + Math.sin(ang) * d1;
+    thickLine(x0, y0, x1, y1, rr(1, 2.6), pick([[255, 220, 130], [255, 255, 255], GOLD]), rr(0.12, 0.3));
+  }
+}
+
+function drawVignette() {
+  // Darken the corners slightly so the centre burns brighter.
+  const cx = W / 2;
+  const cy = H / 2;
+  for (let y = 0; y < H; y += 2) {
+    for (let x = 0; x < W; x += 2) {
+      const dx = (x - cx) / (W / 2);
+      const dy = (y - cy) / (H / 2);
+      const d2 = dx * dx + dy * dy;
+      if (d2 > 0.85) {
+        const a = Math.min(0.32, (d2 - 0.85) * 0.55);
+        blendPixel(x, y, 4, 4, 18, a);
+        blendPixel(x + 1, y, 4, 4, 18, a);
+        blendPixel(x, y + 1, 4, 4, 18, a);
+        blendPixel(x + 1, y + 1, 4, 4, 18, a);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main: paint back to front, encode, write $MAKEFUN_OUTPUT_DIR/entry.png.
+// ---------------------------------------------------------------------------
+function main() {
+  drawSky();
+  drawCity();
+  drawPainting();
+  drawFrame();
+  drawShards();
+  drawPhoenix();
+  drawEmbers();
+  drawStreaks();
+  drawVignette();
+
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR || "out";
+  fs.mkdirSync(outDir, { recursive: true });
+  const png = encodePNG();
+  fs.writeFileSync(path.join(outDir, "entry.png"), png);
+}
+
+main();
